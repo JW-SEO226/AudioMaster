@@ -23,7 +23,10 @@
 
 static const char *TAG = "SMART_CAR_SPEAKER";
 
-#define COMMAND_UART_PORT_NUM  UART_NUM_0
+// #define COMMAND_UART_PORT_NUM  UART_NUM_0
+#define COMMAND_UART_PORT_NUM  UART_NUM_1   
+#define UART1_TX_PIN           14           // 라즈베리 파이 RX로 가는 핀
+#define UART1_RX_PIN           15           // 라즈베리 파이 TX에서 오는 핀
 #define BAUD_RATE              115200
 #define BUF_SIZE               1024
 #define RMS_THRESHOLD          300.0f
@@ -66,14 +69,15 @@ static void cmd_control_task(void *arg) {
 }
 
 // ==========================================
-// 마이크 RMS 감지 태스크
+// 마이크 RMS 감지 및 Pi 연동 태스크 (0.25초 통신 최적화)
 // ==========================================
 static void audio_read_task(void *arg) {
     audio_element_handle_t raw_writer_el = (audio_element_handle_t)arg;
     int16_t *mic_buf = (int16_t *)calloc(1, BUF_SIZE);
 
     TickType_t last_log_time     = 0;
-    TickType_t last_trigger_time = 0;
+    
+    // 1초가 아닌 0.25초 동안의 최대값을 담을 변수들
     float      max_rms_per_sec   = 0;
     int16_t    max_peak_per_sec  = 0;
     float      max_delta_rms     = 0;
@@ -81,47 +85,66 @@ static void audio_read_task(void *arg) {
 
     while (1) {
         int bytes_read = raw_stream_read(raw_writer_el, (char *)mic_buf, BUF_SIZE);
+        
         if (bytes_read > 0) {
             int total_samples = bytes_read / sizeof(int16_t);
             int64_t sum_squares  = 0;
             int16_t current_peak = 0;
 
+            // 1. Peak 및 RMS(제곱합) 계산
             for (int i = 0; i < total_samples; i++) {
                 int16_t val = mic_buf[i];
                 if (abs(val) > current_peak) current_peak = abs(val);
                 sum_squares += (int64_t)val * val;
             }
 
+            // 2. 현재 프레임의 RMS 및 dBFS 변환
             float current_rms    = sqrtf((float)sum_squares / total_samples);
             float current_rms_db = (current_rms > 0.0f)
                                  ? 20.0f * log10f(current_rms / 32768.0f)
                                  : -96.0f;
+                                 
+            // 3. 델타 RMS (ΔdB) 계산
             float delta_rms_db   = current_rms_db - prev_rms_db;
             prev_rms_db          = current_rms_db;
 
+            // 4. 구간(0.25초) 내 최대값 갱신
             if (current_rms  > max_rms_per_sec) max_rms_per_sec  = current_rms;
             if (current_peak > max_peak_per_sec) max_peak_per_sec = current_peak;
             if (delta_rms_db > max_delta_rms)    max_delta_rms    = delta_rms_db;
 
             TickType_t now = xTaskGetTickCount();
-            if (now - last_log_time > pdMS_TO_TICKS(1000)) {
-                ESP_LOGI(TAG, "최대 RMS: %.2f | dBFS: %.2f | ΔdBFS: %.2f | Peak: %d",
-                         max_rms_per_sec, current_rms_db, max_delta_rms, max_peak_per_sec);
-                last_log_time   = now;
-                max_rms_per_sec = 0; max_peak_per_sec = 0; max_delta_rms = 0;
-            }
+            
+            // ==========================================
+            // 💡 [핵심 연동 파트] 250ms(0.25초)마다 라즈베리 파이로 데이터 발사
+            // ==========================================
+            if (now - last_log_time > pdMS_TO_TICKS(250)) {
+                
+                // 터미널 디버깅용 로그 (화면이 너무 빨리 올라가면 주석 처리하셔도 됩니다)
+                ESP_LOGI(TAG, "🎤 dB: %.2f | ΔdB: %.2f | Peak: %d", current_rms_db, delta_rms_db, max_peak_per_sec);
+                
+                // 파이썬이 정확히 파싱(Parsing)할 수 있도록 텍스트 조립
+                char uart_buf[128];
+                int len = snprintf(uart_buf, sizeof(uart_buf), "RMS_DB=%.2f,DRMS_DB=%.2f,PEAK=%d\n", 
+                                   current_rms_db, delta_rms_db, max_peak_per_sec);
+                
+                // UART 0번 포트로 전송
+                uart_write_bytes(COMMAND_UART_PORT_NUM, uart_buf, len);
 
-            if (current_rms > RMS_THRESHOLD) {
-                if (now - last_trigger_time > pdMS_TO_TICKS(1000)) {
-                    ESP_LOGW(TAG, "외부 소리 감지! (RMS: %.2f)", current_rms);
-                    uart_write_bytes(COMMAND_UART_PORT_NUM, "TRIGGER\n", 8);
-                    last_trigger_time = now;
-                }
+                // 다음 0.25초를 위해 변수 초기화
+                last_log_time   = now;
+                max_rms_per_sec = 0; 
+                max_peak_per_sec = 0; 
+                max_delta_rms = 0;
             }
+            // ==========================================
+            
         } else {
+            // 버퍼에 읽을 데이터가 없으면 잠시 대기 (CPU 과부하 방지)
             vTaskDelay(pdMS_TO_TICKS(5));
         }
     }
+    
     free(mic_buf);
     vTaskDelete(NULL);
 }
@@ -275,9 +298,8 @@ void app_main(void) {
     audio_event_iface_handle_t evt  = audio_event_iface_init(&evt_cfg);
     audio_pipeline_set_listener(g_play_pipeline,     evt);
     audio_pipeline_set_listener(g_recorder_pipeline, evt);
-
     // ==========================================
-    // 4. UART 초기화
+    // 4. UART 초기화 (수정됨)
     // ==========================================
     uart_config_t uart_cfg = {
         .baud_rate  = BAUD_RATE,
@@ -290,6 +312,8 @@ void app_main(void) {
     uart_driver_install(COMMAND_UART_PORT_NUM, BUF_SIZE * 2, 0, 0, NULL, 0);
     uart_param_config(COMMAND_UART_PORT_NUM, &uart_cfg);
 
+    // 💡 [핵심 추가] UART1 통신을 방금 설정한 14번, 15번 핀으로 뽑아낸다!
+    uart_set_pin(COMMAND_UART_PORT_NUM, UART1_TX_PIN, UART1_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     esp_bt_dev_set_device_name("ESP_SMART_SPEAKER");
     esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
 
@@ -299,6 +323,6 @@ void app_main(void) {
     audio_pipeline_run(g_play_pipeline);
 
     xTaskCreate(cmd_control_task,    "cmd_task",    4096, NULL,         10, NULL);
-    xTaskCreate(audio_read_task,     "audio_read",  4096, g_raw_writer, 10, NULL);
+    xTaskCreate(audio_read_task,cat /dev/serial0     "audio_read",  4096, g_raw_writer, 10, NULL);
     xTaskCreate(pipeline_event_task, "event_task",  4096, evt,          9, NULL);
 }
